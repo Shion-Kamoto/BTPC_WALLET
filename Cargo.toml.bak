@@ -1,0 +1,55 @@
+[package]
+name = "btpc_wallet"
+version = "0.1.0"
+edition = "2021"
+authors = ["<shion.kamoto>@mail.com>"]
+license = "MIT OR Apache-2.0"
+description = "BTPC Stand-Alone Wallet (Dilithium5) – CLI first, optional GUI later"
+readme = "README.md"
+repository = ""
+
+[dependencies]
+base64 = "0.22"
+pqcrypto = { version = "0.18"}
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+hex = "0.4"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+rpassword = "7"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+toml = "0.8"
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"
+chacha20poly1305 = { version = "0.10", features = ["alloc","std"] }
+argon2 = { version = "0.5", features = ["std"] }
+getrandom = "0.2"
+secrecy = "0.10.3"
+# Mnemonics
+bip39 = { version = "2", default-features = false, features = ["std", "rand"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+url = "2"
+
+[dev-dependencies]
+assert-json-diff = "2"
+serde_json = "1"
+rand = "0.8"
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+insta = { version = "1", features = ["yaml"] }
+
+[features]
+# Toggle alternative mnemonic checksum using SHA-512 (documented behavior)
+sha512-mnemonic = []
+deterministic-mnemonic = []
+

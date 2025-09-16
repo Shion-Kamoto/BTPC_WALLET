@@ -1,0 +1,182 @@
+use std::{fs, path::Path};
+use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
+use secrecy::SecretVec;
+
+use crate::wallet::mnemonic::{generate_mnemonic_24, derive_dilithium5_keypair_from_mnemonic};
+use crate::wallet::keystore::{encrypt_sk, decrypt_sk, KdfParams, encrypt_sk_with_params};
+
+/// Create a new wallet.json given a passphrase. Saves mnemonic to `wallet.mnemonic.txt` next to wallet file.
+/// Returns the derived address.
+pub fn create_new_wallet(wallet_path: &Path, passphrase: &str, network: &str) -> Result<String> {
+    // Generate mnemonic and pk/sk bytes (deterministic if feature enabled)
+    let mnemonic = generate_mnemonic_24();
+    let (pk, sk, addr) = derive_dilithium5_keypair_from_mnemonic(&mnemonic, None);
+
+    // Encrypt secret key
+    let enc = encrypt_sk(passphrase, &sk)?;
+
+    // Encode components
+    let pk_b64 = general_purpose::STANDARD.encode(&pk);
+    let salt_b64 = general_purpose::STANDARD.encode(&enc.salt);
+    let nonce_b64 = general_purpose::STANDARD.encode(&enc.nonce);
+    let ct_b64 = general_purpose::STANDARD.encode(&enc.ciphertext);
+
+    // Minimal wallet JSON
+    let wallet_json = serde_json::json!({
+        "version": 1,
+        "network": network,
+        "address": addr,
+        "public_key": pk_b64,
+        "secret_key_enc": ct_b64,
+        "cipher": "chacha20poly1305",
+        "kdf": { "m": 65536, "t": 3, "p": 1, "salt": salt_b64, "name": "argon2id" },
+        "nonce": nonce_b64,
+        "balance_cached": 0,
+        "last_scanned_height": 0
+    });
+
+    fs::write(wallet_path, serde_json::to_string_pretty(&wallet_json)?)?;
+
+    // Write mnemonic file (user must store safely)
+    let mnemonic_path = wallet_path.with_file_name("wallet.mnemonic.txt");
+    fs::write(&mnemonic_path, mnemonic.to_string())?;
+
+    Ok(wallet_json["address"].as_str().unwrap_or_default().to_string())
+}
+
+/// Restore wallet.json from a mnemonic text file. Returns the derived address.
+pub fn restore_wallet_from_mnemonic_file(wallet_path: &Path, mnemonic_file: &Path, passphrase: &str, network: &str) -> Result<String> {
+    let phrase = fs::read_to_string(mnemonic_file)?;
+    let m = bip39::Mnemonic::parse_normalized(phrase.trim())?;
+    let (pk, sk, addr) = derive_dilithium5_keypair_from_mnemonic(&m, None);
+
+    let enc = encrypt_sk(passphrase, &sk)?;
+    let pk_b64 = general_purpose::STANDARD.encode(&pk);
+    let salt_b64 = general_purpose::STANDARD.encode(&enc.salt);
+    let nonce_b64 = general_purpose::STANDARD.encode(&enc.nonce);
+    let ct_b64 = general_purpose::STANDARD.encode(&enc.ciphertext);
+
+    let wallet_json = serde_json::json!({
+        "version": 1,
+        "network": network,
+        "address": addr,
+        "public_key": pk_b64,
+        "secret_key_enc": ct_b64,
+        "cipher": "chacha20poly1305",
+        "kdf": { "m": 65536, "t": 3, "p": 1, "salt": salt_b64, "name": "argon2id" },
+        "nonce": nonce_b64,
+        "balance_cached": 0,
+        "last_scanned_height": 0
+    });
+
+    fs::write(wallet_path, serde_json::to_string_pretty(&wallet_json)?)?;
+    Ok(wallet_json["address"].as_str().unwrap_or_default().to_string())
+}
+
+/// Load wallet address from wallet.json
+pub fn load_wallet_address(wallet_path: &Path) -> Result<String> {
+    let s = fs::read_to_string(wallet_path)?;
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+    let addr = v.get("address").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    Ok(addr)
+}
+
+/// Export encrypted key material and KDF params to a backup JSON.
+pub fn export_encrypted_backup(wallet_path: &Path, out_path: &Path) -> Result<()> {
+    let s = fs::read_to_string(wallet_path)?;
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+    let export = serde_json::json!({
+        "address": v["address"],
+        "public_key": v["public_key"],
+        "secret_key_enc": v["secret_key_enc"],
+        "cipher": v["cipher"],
+        "kdf": v["kdf"],
+        "nonce": v["nonce"],
+        "created_at": v.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+        "note": "Keep this file secret. It contains your encrypted private key."
+    });
+    fs::write(out_path, serde_json::to_string_pretty(&export)?)?;
+    Ok(())
+}
+
+/// Load (address, SecretVec<sk_bytes>) from wallet.json using passphrase; used by CLI `send`.
+pub fn load_secret_key_and_address(wallet_path: &Path, passphrase: &str) -> Result<(String, SecretVec<u8>)> {
+    let s = fs::read_to_string(wallet_path)?;
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+
+    let addr = v["address"].as_str().ok_or_else(|| anyhow::anyhow!("missing address"))?.to_string();
+    let salt_str = v["kdf"]["salt"].as_str().ok_or_else(|| anyhow::anyhow!("missing kdf.salt"))?;
+    let nonce_b64 = v["nonce"].as_str().ok_or_else(|| anyhow::anyhow!("missing nonce"))?;
+    let ct_b64 = v["secret_key_enc"].as_str().ok_or_else(|| anyhow::anyhow!("missing secret_key_enc"))?;
+
+    let nonce_bytes = general_purpose::STANDARD.decode(nonce_b64)?;
+    if nonce_bytes.len() < 12 { return Err(anyhow::anyhow!("nonce too short")); }
+    let mut nonce = [0u8;12];
+    nonce.copy_from_slice(&nonce_bytes[..12]);
+
+    let ciphertext = general_purpose::STANDARD.decode(ct_b64)?;
+
+    let sk_raw = decrypt_sk(passphrase, salt_str, &nonce, &ciphertext)?;
+    Ok((addr, SecretVec::new(sk_raw)))
+}
+
+/// Change wallet passphrase (and optionally KDF params). Writes in place.
+pub fn change_passphrase(wallet_path: &Path, old_pass: &str, new_pass: &str, new_m: Option<u32>, new_t: Option<u32>, new_p: Option<u32>) -> Result<()> {
+    let s = fs::read_to_string(wallet_path)?;
+    let mut v: serde_json::Value = serde_json::from_str(&s)?;
+
+    let kdf_v = v.get("kdf").cloned().unwrap_or(serde_json::json!({ "m":65536, "t":3, "p":1, "name":"argon2id" }));
+    let m = kdf_v["m"].as_u64().unwrap_or(65536) as u32;
+    let t = kdf_v["t"].as_u64().unwrap_or(3) as u32;
+    let p = kdf_v["p"].as_u64().unwrap_or(1) as u32;
+
+    let salt_str = kdf_v["salt"].as_str().ok_or_else(|| anyhow::anyhow!("missing kdf.salt"))?;
+    let nonce_b64 = v["nonce"].as_str().ok_or_else(|| anyhow::anyhow!("missing nonce"))?;
+    let ct_b64 = v["secret_key_enc"].as_str().ok_or_else(|| anyhow::anyhow!("missing secret_key_enc"))?;
+
+    let nonce_bytes = general_purpose::STANDARD.decode(nonce_b64)?;
+    let mut nonce_arr = [0u8;12];
+    nonce_arr.copy_from_slice(&nonce_bytes[..12]);
+    let ct = general_purpose::STANDARD.decode(ct_b64)?;
+
+    // decrypt using old pass + existing params
+    let sk = decrypt_sk(old_pass, salt_str, &nonce_arr, &ct)?;
+
+    // re-encrypt with new pass + (possibly) new params
+    let new_params = KdfParams {
+        m: new_m.unwrap_or(m),
+        t: new_t.unwrap_or(t),
+        p: new_p.unwrap_or(p),
+        name: "argon2id".into(),
+    };
+    let enc = encrypt_sk_with_params(new_pass, &sk, &new_params)?;
+    v["kdf"]["m"] = serde_json::json!(new_params.m);
+    v["kdf"]["t"] = serde_json::json!(new_params.t);
+    v["kdf"]["p"] = serde_json::json!(new_params.p);
+    v["kdf"]["name"] = serde_json::json!("argon2id");
+    v["kdf"]["salt"] = serde_json::json!(general_purpose::STANDARD.encode(&enc.salt));
+    v["nonce"] = serde_json::json!(general_purpose::STANDARD.encode(&enc.nonce));
+    v["secret_key_enc"] = serde_json::json!(general_purpose::STANDARD.encode(&enc.ciphertext));
+
+    fs::write(wallet_path, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
+
+/// Verify an encrypted backup JSON by attempting decryption (without writing anything)
+pub fn verify_encrypted_backup(backup_path: &Path, passphrase: &str) -> Result<()> {
+    let s = fs::read_to_string(backup_path)?;
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+    let salt_str = v["kdf"]["salt"].as_str().ok_or_else(|| anyhow::anyhow!("missing kdf.salt"))?;
+    let nonce_b64 = v["nonce"].as_str().ok_or_else(|| anyhow::anyhow!("missing nonce"))?;
+    let ct_b64 = v["secret_key_enc"].as_str().ok_or_else(|| anyhow::anyhow!("missing secret_key_enc"))?;
+
+    let nonce_bytes = general_purpose::STANDARD.decode(nonce_b64)?;
+    if nonce_bytes.len() < 12 { return Err(anyhow::anyhow!("nonce too short")); }
+    let mut nonce = [0u8;12];
+    nonce.copy_from_slice(&nonce_bytes[..12]);
+
+    let ct = general_purpose::STANDARD.decode(ct_b64)?;
+    let _sk = decrypt_sk(passphrase, salt_str, &nonce, &ct)?;
+    Ok(())
+}

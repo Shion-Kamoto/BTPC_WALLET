@@ -1,0 +1,16 @@
+use sha2::{Digest, Sha512};
+use crate::utils::hex_lower;
+
+use pqcrypto::sign::dilithium5::{keypair, PublicKey, SecretKey};
+
+pub struct Keypair { pub pk: Vec<u8>, pub sk: Vec<u8> }
+
+pub fn generate_keypair() -> Keypair {
+    let (pk, sk): (PublicKey, SecretKey) = keypair();
+    Keypair { pk: pk.as_bytes().to_vec(), sk: sk.as_bytes().to_vec() }
+}
+
+pub fn derive_address_from_pk(pk: &[u8]) -> String {
+    let digest = Sha512::digest(pk);
+    hex_lower(&digest)
+}

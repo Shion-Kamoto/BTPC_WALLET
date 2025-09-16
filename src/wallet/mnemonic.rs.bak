@@ -1,0 +1,33 @@
+use bip39::{Language, Mnemonic, Seed};
+use hkdf::Hkdf;
+use sha2::Sha512;
+
+use crate::wallet::key::derive_address_from_pk;
+
+// Deterministic Dilithium5 via dilithium-raw with a seeded 128-byte RNG buffer.
+pub fn generate_mnemonic_24() -> Mnemonic {
+    Mnemonic::generate_in(Language::English, 24).expect("entropy gen")
+}
+
+/// Convert mnemonic (and optional passphrase) to a 64-byte seed.
+pub fn mnemonic_to_seed(mnemonic: &Mnemonic, passphrase: Option<&str>) -> Vec<u8> {
+    let pass = passphrase.unwrap_or("");
+    let seed = Seed::new(mnemonic, pass);
+    seed.as_bytes().to_vec()
+}
+
+/// Deterministically derive a Dilithium5 keypair from a mnemonic+passphrase.
+/// Uses HKDF-SHA512 to expand the BIP-39 seed into 128 bytes of randomness
+/// consumed by dilithium_raw::dilithium5::generate_keypair().
+pub fn derive_dilithium5_keypair_from_mnemonic(mnemonic: &Mnemonic, passphrase: Option<&str>) -> (Vec<u8>, Vec<u8>, String) {
+    use dilithium_raw::dilithium5::generate_keypair;
+
+    let seed = mnemonic_to_seed(mnemonic, passphrase);
+    let hk = Hkdf::<Sha512>::new(None, &seed);
+    let mut random = [0u8; 128];
+    hk.expand(b,"BTPC-DILITHIUM5-KEYGEN-v1", &mut random).expect("HKDF expand");
+
+    let (pk, sk) = generate_keypair(&mut random);
+    let addr = derive_address_from_pk(&pk);
+    (pk.to_vec(), sk.to_vec(), addr)
+}
